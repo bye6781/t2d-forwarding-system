@@ -1756,7 +1756,7 @@ const app = createApp({
     }
     async function toggleBotEnabled(row) {
       try {
-        await api.put('/dingtalk/bots/' + row.id, { enabled: row.enabled });
+        await api.put('/dingtalk/bots/' + row.bot_id, { enabled: row.enabled });
         ElementPlus.ElMessage.success(row.enabled ? '已启用' : '已禁用');
       } catch {
         row.enabled = !row.enabled;
@@ -2151,7 +2151,7 @@ const app = createApp({
     async function saveBot() {
       try {
         submitLoading.value = true;
-        if (botForm.id) await api.put('/dingtalk/bots/' + botForm.id, { name: botForm.name, webhook: botForm.webhook, secret: botForm.secret, enabled: botForm.enabled });
+        if (botForm.id) await api.put('/dingtalk/bots/' + botForm.bot_id, { name: botForm.name, webhook: botForm.webhook, secret: botForm.secret, enabled: botForm.enabled });
         else await api.post('/dingtalk/bots', { name: botForm.name, bot_id: botForm.bot_id, webhook: botForm.webhook, secret: botForm.secret, enabled: botForm.enabled });
         botDialogVisible.value = false;
         ElementPlus.ElMessage.success('保存成功');
@@ -2160,7 +2160,7 @@ const app = createApp({
       finally { submitLoading.value = false; }
     }
     async function testBot(row) { try { await api.post('/dingtalk/bots/test', { bot_id: row.bot_id, message: 'T2D Cloud 测试消息 ✅' }); ElementPlus.ElMessage.success('测试消息已发送到钉钉'); } catch { ElementPlus.ElMessage.error('发送失败，请检查 Webhook 配置'); } }
-    async function deleteBot(row) { try { await ElementPlus.ElMessageBox.confirm('确定删除此钉钉机器人？', '确认删除', { type: 'warning' }); } catch { return; } try { await api.delete('/dingtalk/bots/' + row.id); ElementPlus.ElMessage.success('已删除'); await loadDingTalkBots(); } catch { ElementPlus.ElMessage.error('删除失败'); } }
+    async function deleteBot(row) { try { await ElementPlus.ElMessageBox.confirm('确定删除此钉钉机器人？', '确认删除', { type: 'warning' }); } catch { return; } try { await api.delete('/dingtalk/bots/' + row.bot_id); ElementPlus.ElMessage.success('已删除'); await loadDingTalkBots(); } catch { ElementPlus.ElMessage.error('删除失败'); } }
 
     // ---- Mappings ----
     function showAddMappingDialog() { if (!dingBots.value.length) { ElementPlus.ElMessage.warning('请先添加钉钉机器人'); return; } Object.assign(mappingForm, { id: null, source_chat_id: '', target_bot_ids: [], translation_enabled: true, filter_enabled: true, enabled: true }); mappingDialogVisible.value = true; }
