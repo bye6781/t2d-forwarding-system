@@ -1,0 +1,24 @@
+services:
+  t2d-saas:
+    build: ./backend
+    container_name: t2d-saas
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./frontend:/app/static
+    environment:
+      - TZ=Asia/Shanghai
+      - DATABASE_URL=postgresql://t2d:t2d-saas-2026@localhost:5432/t2d_saas
+      - REDIS_URL=redis://localhost:6379/0
+      - JWT_SECRET=t2d-saas-jwt-secret-2026
+      - DATA_DIR=/app/data
+      - LOGS_DIR=/app/logs
+      - API_PORT=8001
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen(\"http://localhost:8001/api/system/health\")"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

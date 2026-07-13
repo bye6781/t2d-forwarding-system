@@ -1,0 +1,30 @@
+# Web 框架
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+starlette==0.38.0
+
+# 数据库
+asyncpg==0.29.0
+
+# Redis
+redis==5.0.0
+
+# 认证
+PyJWT==2.8.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
+# Telegram
+telethon==1.36.0
+
+# HTTP 客户端（钉钉 API）
+aiohttp==3.10.0
+
+# 翻译（DeepSeek）
+openai==1.50.0
+
+# 工具
+python-dotenv==1.0.1
+pydantic==2.9.0
+pydantic-settings==2.5.0
