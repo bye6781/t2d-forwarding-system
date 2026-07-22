@@ -159,6 +159,43 @@ def test_startup_reconnect_never_requests_a_login_code(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_photo_forward_keeps_image_before_original_markdown_text(monkeypatch):
+    from app.modules.connectors.repository import connector_repository
+    from app.modules.forwarding.repository import forwarding_repository
+    from app.modules.policies.repository import policy_repository
+    from app.services.dingtalk_service import dingtalk_service
+    from app.services.forwarding_service import ForwardingService
+    from app.services.translation_service import translation_service
+
+    send_markdown = AsyncMock(return_value={"errcode": 0})
+    monkeypatch.setattr(connector_repository, "bots", AsyncMock(return_value=[{
+        "id": 9,
+        "bot_id": "dingtalk-9",
+        "webhook": "https://example.test/webhook",
+        "secret": "",
+        "enabled": True,
+    }]))
+    monkeypatch.setattr(policy_repository, "default_template_for_forwarding", AsyncMock(return_value=None))
+    monkeypatch.setattr(translation_service, "translate", AsyncMock(side_effect=lambda text, target_lang: text))
+    monkeypatch.setattr(dingtalk_service, "send_markdown", send_markdown)
+    monkeypatch.setattr(forwarding_repository, "add_record", AsyncMock())
+
+    async def scenario():
+        await ForwardingService()._forward_to_dingtalk(
+            tenant_id=0,
+            mapping={"target_bot_ids": [9], "translation_enabled": True},
+            message_text="标题\n正文",
+            message_md="**标题**\n正文",
+            media_info={"type": "photo", "url": "https://cdn.test/photo.jpg", "forward_as_link": False},
+            sender_name="sender",
+            message_id=1,
+        )
+        text = send_markdown.await_args.kwargs["text"]
+        assert text == "![图片](https://cdn.test/photo.jpg)\n\n**标题**\n正文"
+
+    asyncio.run(scenario())
+
+
 def test_dingtalk_test_uses_send_text_content_parameter(monkeypatch):
     from app.modules.connectors.repository import connector_repository
     from app.modules.connectors.service import connector_service

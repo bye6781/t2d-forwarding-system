@@ -101,6 +101,16 @@ def format_markdown(md_text: str) -> str:
     return result.strip()
 
 
+def preserve_markdown_format(source_md: str, translated_text: str) -> str:
+    """Keep Telegram formatting when a translation provider strips Markdown markers."""
+    if not translated_text or not source_md:
+        return source_md or translated_text or ""
+    markers = ("**", "__", "~~", "`", "](")
+    if any(marker in source_md and marker not in translated_text for marker in markers):
+        return source_md
+    return translated_text
+
+
 class ForwardingService:
     """多租户消息转发引擎"""
 
@@ -396,9 +406,10 @@ class ForwardingService:
             final_text = display_text
             if message_text and translation_enabled:
                 try:
-                    final_text = await translation_service.translate(message_text, target_lang="zh")
+                    translated_text = await translation_service.translate(message_text, target_lang="zh")
+                    final_text = preserve_markdown_format(message_md, translated_text)
                 except Exception:
-                    final_text = message_text
+                    final_text = message_md or message_text
 
             template = await policy_repository.default_template_for_forwarding(tenant_id)
             if template:
@@ -434,7 +445,8 @@ class ForwardingService:
                 if media_info and media_info.get("type") == "photo" and not media_info.get("forward_as_link"):
                     media_url = media_info.get("url", "")
                     clean_text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', final_text, flags=re.DOTALL).strip()
-                    full_text = f"{clean_text}\n\n![图片]({media_url})" if clean_text else f"![图片]({media_url})"
+                    # Keep the original image first, followed by its Telegram caption/text.
+                    full_text = f"![图片]({media_url})\n\n{clean_text}" if clean_text else f"![图片]({media_url})"
                     result = await dingtalk_service.send_markdown(
                         webhook=webhook, title="消息转发", text=full_text,
                         secret=secret, bot_id=bot_id_str
