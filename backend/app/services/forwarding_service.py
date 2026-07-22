@@ -101,14 +101,52 @@ def format_markdown(md_text: str) -> str:
     return result.strip()
 
 
-def preserve_markdown_format(source_md: str, translated_text: str) -> str:
-    """Keep Telegram formatting when a translation provider strips Markdown markers."""
-    if not translated_text or not source_md:
-        return source_md or translated_text or ""
-    markers = ("**", "__", "~~", "`", "](")
-    if any(marker in source_md and marker not in translated_text for marker in markers):
-        return source_md
-    return translated_text
+MARKDOWN_TOKEN_PATTERN = re.compile(
+    r"\]\([^)]*\)|```|\*\*|__|~~|`|(?<!\*)\*(?!\*)|(?<!_)_(?!_)"
+)
+
+
+def protect_markdown_format(source_md: str) -> tuple[str, dict[str, str]]:
+    """Replace Markdown syntax with stable tokens before machine translation."""
+    tokens: dict[str, str] = {}
+
+    def replace(match: re.Match) -> str:
+        token = f"[[T2D_FMT_{len(tokens)}]]"
+        tokens[token] = match.group(0)
+        return token
+
+    return MARKDOWN_TOKEN_PATTERN.sub(replace, source_md), tokens
+
+
+def restore_markdown_format(translated_text: str, tokens: dict[str, str]) -> str:
+    restored = translated_text or ""
+    for token, marker in tokens.items():
+        restored = restored.replace(token, marker)
+    return restored
+
+
+def normalize_dingtalk_markdown(md_text: str) -> str:
+    """Convert Telegram Markdown into the subset rendered reliably by DingTalk."""
+    if not md_text:
+        return ""
+    normalized = md_text.replace("__", "**")
+    normalized = re.sub(r"\*{3,}", "**", normalized)
+
+    def split_multiline(match: re.Match) -> str:
+        marker, content = match.group(1), match.group(2)
+        if "\n" not in content:
+            return match.group(0)
+        return "\n".join(
+            f"{marker}{line}{marker}" if line.strip() else ""
+            for line in content.split("\n")
+        )
+
+    normalized = re.sub(r"(\*\*|~~)(.*?)\1", split_multiline, normalized, flags=re.DOTALL)
+    if normalized.count("**") % 2:
+        normalized += "**"
+    if normalized.count("~~") % 2:
+        normalized += "~~"
+    return normalized.strip()
 
 
 class ForwardingService:
@@ -190,7 +228,7 @@ class ForwardingService:
             media = getattr(message, 'media', None)
 
         message_text = html_to_plain_text(message_html)
-        message_md = html_to_markdown(message_html)
+        message_md = getattr(message, "text_markdown", "") or html_to_markdown(message_html)
 
         self._stats["messages_received"] += 1
 
@@ -406,8 +444,9 @@ class ForwardingService:
             final_text = display_text
             if message_text and translation_enabled:
                 try:
-                    translated_text = await translation_service.translate(message_text, target_lang="zh")
-                    final_text = preserve_markdown_format(message_md, translated_text)
+                    protected_text, format_tokens = protect_markdown_format(display_text)
+                    translated_text = await translation_service.translate(protected_text, target_lang="zh")
+                    final_text = restore_markdown_format(translated_text, format_tokens)
                 except Exception:
                     final_text = message_md or message_text
 
@@ -424,6 +463,7 @@ class ForwardingService:
                         "chat_id": str(mapping.get("source_chat_id", "")),
                     },
                 )
+            final_text = normalize_dingtalk_markdown(final_text)
 
             for bot_ref in target_bot_ids:
                 # bot_ref 可能是 bot_id 字符串或数字 ID
