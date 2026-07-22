@@ -102,7 +102,7 @@ def format_markdown(md_text: str) -> str:
 
 
 MARKDOWN_TOKEN_PATTERN = re.compile(
-    r"\]\([^)]*\)|```|\*\*|__|~~|`|(?<!\*)\*(?!\*)|(?<!_)_(?!_)"
+    r"\r?\n|[ \t]+|\]\([^)]*\)|```|\*\*|__|~~|`|(?<!\*)\*(?!\*)|(?<!_)_(?!_)"
 )
 
 
@@ -142,6 +142,11 @@ def normalize_dingtalk_markdown(md_text: str) -> str:
         )
 
     normalized = re.sub(r"(\*\*|~~)(.*?)\1", split_multiline, normalized, flags=re.DOTALL)
+    normalized = re.sub(
+        r"[ \t]{2,}",
+        lambda match: "&nbsp;" * len(match.group(0)),
+        normalized,
+    )
     if normalized.count("**") % 2:
         normalized += "**"
     if normalized.count("~~") % 2:

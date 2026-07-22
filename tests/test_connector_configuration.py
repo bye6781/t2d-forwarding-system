@@ -196,6 +196,22 @@ def test_photo_forward_keeps_image_before_original_markdown_text(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_translation_protection_preserves_spaces_and_line_breaks():
+    from app.services.forwarding_service import (
+        normalize_dingtalk_markdown,
+        protect_markdown_format,
+        restore_markdown_format,
+    )
+
+    source = "XAUUSD  SELL NOW\n\nTake Profit  4120"
+    protected, tokens = protect_markdown_format(source)
+    assert "XAUUSD" in protected
+    assert "[[T2D_FMT_" in protected
+    restored = restore_markdown_format(protected, tokens)
+    assert restored == source
+    assert "&nbsp;&nbsp;" in normalize_dingtalk_markdown(restored)
+
+
 def test_dingtalk_test_uses_send_text_content_parameter(monkeypatch):
     from app.modules.connectors.repository import connector_repository
     from app.modules.connectors.service import connector_service
