@@ -8,8 +8,8 @@ from typing import Optional
 
 import aiohttp
 
-from app.core.database import database
 from app.core.tenant_context import TenantContext
+from app.modules.policies.repository import policy_repository
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class TranslationService:
         if tenant_id in self._config_cache:
             return self._config_cache[tenant_id]
 
-        config = await database.get_translation_config(tenant_id)
+        config = await policy_repository.translation(tenant_id)
         if config:
             self._config_cache[tenant_id] = config
         return config

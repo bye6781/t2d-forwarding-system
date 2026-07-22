@@ -7,6 +7,8 @@ import asyncio
 import logging
 from typing import Optional, Callable, Any, List, Dict
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,7 @@ class TelegramAccount:
 
     @property
     def session_path(self) -> str:
-        return f"/app/data/sessions/{self.tenant_id}/{self.account_id}"
+        return f"{settings.PRIVATE_DATA_DIR}/sessions/{self.tenant_id}/{self.account_id}"
 
     async def connect(self):
         """连接到 Telegram"""
@@ -185,24 +187,21 @@ class TelegramService:
 
     async def send_code(self, tenant_id: int, account_db_id: int,
                         api_id: int, api_hash: str, phone: str) -> Dict:
-        """发送验证码（不连接，仅发送 code）"""
-        import os
-        from telethon import TelegramClient
-
-        session_path = f"/app/data/sessions/{tenant_id}/{account_db_id}"
-        os.makedirs(os.path.dirname(session_path), exist_ok=True)
-
-        client = TelegramClient(session_path, api_id, api_hash)
+        """发送验证码并保留连接，供后续验证复用同一个 code hash。"""
         try:
-            await client.connect()
-            await client.send_code_request(phone)
-            await client.disconnect()
-            return {"success": True, "message": "验证码已发送"}
+            result = await self.connect_account(
+                tenant_id=tenant_id,
+                account_db_id=account_db_id,
+                api_id=api_id,
+                api_hash=api_hash,
+                phone=phone,
+            )
+            if result in (True, "pending_code"):
+                return {"success": True, "message": "验证码已发送"}
+            if result == "need_2fa":
+                return {"success": False, "error": "需要两步验证密码"}
+            return {"success": False, "error": "Telegram 连接失败，请稍后重试"}
         except Exception as e:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
             logger.error(f"Send code failed: {e}")
             return {"success": False, "error": str(e)}
 
@@ -210,7 +209,14 @@ class TelegramService:
                           api_id: int, api_hash: str, phone: str,
                           code: str, password: str = None) -> Dict:
         """验证验证码并建立持久连接"""
-        result = await self.connect_account(tenant_id, account_db_id, api_id, api_hash, phone)
+        account = self.get_account(tenant_id, account_db_id)
+        client = account._client if account else None
+        is_connected = getattr(client, "is_connected", None)
+        client_ready = bool(client and (is_connected() if callable(is_connected) else is_connected))
+        if account and client_ready:
+            result = True if account.connected else "pending_code"
+        else:
+            result = await self.connect_account(tenant_id, account_db_id, api_id, api_hash, phone)
 
         if result is True:
             return {"success": True, "message": "已连接"}

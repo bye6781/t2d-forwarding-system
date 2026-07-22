@@ -1,29 +1,37 @@
-# 收费5000搭建转发系统
+# T2D Cloud
 
-Telegram → DingTalk 多租户消息转发平台 (T2D SaaS)
+多租户 Telegram 到钉钉消息转发平台。
 
-## 功能
-- 多租户隔离架构
-- Telegram 消息采集 → DingTalk 回调转发
-- 消息过滤规则引擎（黑名单/白名单/关键词）
-- 租户管理（团队/成员/权限控制）
-- 用量统计与配额管理
-- 平台管理员套餐变更
-- Vue 3 + Element Plus 前端
-- FastAPI + PostgreSQL 后端
-- Docker 容器化部署
+## 架构
 
-## 技术栈
-- **后端**: Python 3.11 + FastAPI + asyncpg
-- **前端**: Vue 3 + Element Plus (CDN SPA)
-- **数据库**: PostgreSQL 16
-- **部署**: Docker + Docker Compose + Nginx
+- Vue 3、Vite、TypeScript、Pinia、Element Plus
+- FastAPI 领域模块单体
+- PostgreSQL 业务数据与 Alembic 迁移
+- Redis 租户运行状态、消息去重和分布式状态
+- Docker 多阶段构建，Nginx 负责 HTTPS 反向代理
 
-## 部署
+## 本地检查
+
 ```bash
-docker-compose up -d
+cd frontend
+npm ci
+npm test
+npm run build
+
+cd ..
+python -m pytest -q
+python -m compileall -q backend
 ```
 
-## 默认账户
-- 平台管理员: admin / admin123
-- 测试用户: testuser / test123456
+## 部署
+
+生产密码、数据库地址和 JWT 密钥必须通过 `.env` 注入：
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+健康检查：`GET /api/v2/system/health`。
+
+Telegram session 保存在私有卷 `data/private`，公开媒体保存在 `data/public-media`。

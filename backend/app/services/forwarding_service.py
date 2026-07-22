@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -17,13 +18,19 @@ from telethon.tl.types import (
     DocumentAttributeVideo, DocumentAttributeAudio,
 )
 
-from app.core.database import database
 from app.core.tenant_context import TenantContext
 from app.services.telegram_service import telegram_service
 from app.services.dingtalk_service import dingtalk_service
 from app.services.translation_service import translation_service
 from app.services.filter_service import filter_service
 from app.services.quota_service import quota_service
+from app.core.config import settings
+from app.modules.forwarding.repository import forwarding_repository
+from app.modules.connectors.repository import connector_repository
+from app.modules.policies.repository import policy_repository
+from app.modules.forwarding.runtime import tenant_runtime
+from app.modules.policies.media import evaluate_media_policy
+from app.modules.policies.templates import render_message_template
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +107,6 @@ class ForwardingService:
     def __init__(self):
         self._running = False
         self._handler_registered = False
-        self._processed_messages: set = set()
         self._pending_albums: Dict[int, List[Dict]] = {}
         self._filtered_albums: set = set()
         self._stats = {"messages_received": 0, "messages_forwarded": 0, "messages_failed": 0}
@@ -120,6 +126,8 @@ class ForwardingService:
     async def _handle_message(self, event, account_id: int = 0, tenant_id: int = 0):
         """处理 Telegram 消息事件 - 自动设置租户上下文"""
         if not self._running:
+            return
+        if not await tenant_runtime.is_running(tenant_id):
             return
 
         # 设置租户上下文
@@ -177,14 +185,8 @@ class ForwardingService:
         self._stats["messages_received"] += 1
 
         # 消息去重
-        msg_key = f"{tenant_id}:{chat_id}:{message_id}"
-        if msg_key in self._processed_messages:
+        if not await tenant_runtime.claim_message(tenant_id, chat_id, message_id):
             return
-        self._processed_messages.add(msg_key)
-        if len(self._processed_messages) > 2000:
-            to_remove = list(self._processed_messages)[:1000]
-            for key in to_remove:
-                self._processed_messages.discard(key)
 
         # 配额检查
         quota_ok = await quota_service.check_message_quota(tenant_id)
@@ -193,33 +195,15 @@ class ForwardingService:
             return
 
         # 查找匹配的映射规则（从 DB 加载）
-        mappings = await database.get_mappings(tenant_id)
+        mappings = await forwarding_repository.routes(tenant_id)
         matched = [m for m in mappings
-                   if m.get("source_chat_id") == chat_id or str(m.get("source_chat_id")) == str(chat_id)]
+                   if m.get("enabled", True)
+                   and (m.get("source_chat_id") == chat_id or str(m.get("source_chat_id")) == str(chat_id))]
 
         if not matched:
             return
 
-        # 过滤检查
-        should_filter, reason = await filter_service.should_filter({
-            "text": message_text, "html": message_html,
-            "chat_id": chat_id, "user_id": sender_id
-        })
-        if should_filter:
-            logger.info(f"[T{tenant_id}] Message filtered: {reason}")
-            return
-
-        # @ 提及过滤
-        mention_pattern = re.compile(r'@[a-zA-Z_]', re.IGNORECASE)
-        if mention_pattern.search(message_text or "") or mention_pattern.search(message_html or ""):
-            return
-
-        # 处理媒体
-        media_info = None
-        if media:
-            media_info = await self._process_media(message, media, tenant_id)
-
-        # 获取发送者名称
+        # 在过滤前解析发送者和消息类型，确保高级规则使用真实字段。
         sender_name = "Unknown"
         try:
             sender = None
@@ -241,6 +225,45 @@ class ForwardingService:
         except Exception as e:
             logger.warning(f"[T{tenant_id}] Failed to get sender: {e}")
 
+        message_type = "text"
+        if isinstance(media, MessageMediaPhoto):
+            message_type = "photo"
+        elif isinstance(media, MessageMediaDocument):
+            doc = media.document
+            mime_type = getattr(doc, "mime_type", "") or ""
+            attributes = doc.attributes or []
+            if any(type(a).__name__ == "DocumentAttributeSticker" for a in attributes):
+                message_type = "sticker"
+            elif any(isinstance(a, DocumentAttributeVideo) for a in attributes) or mime_type.startswith("video/"):
+                message_type = "video"
+            elif mime_type.startswith("image/"):
+                message_type = "photo"
+            elif mime_type.startswith("audio/"):
+                audio = next((a for a in attributes if isinstance(a, DocumentAttributeAudio)), None)
+                message_type = "voice" if getattr(audio, "voice", False) else "audio"
+            else:
+                message_type = "document"
+
+        # 过滤检查
+        should_filter, reason = await filter_service.should_filter({
+            "text": message_text, "html": message_html,
+            "chat_id": chat_id, "user_id": sender_id,
+            "sender": sender_name, "message_type": message_type,
+        })
+        if should_filter:
+            logger.info(f"[T{tenant_id}] Message filtered: {reason}")
+            return
+
+        # @ 提及过滤
+        mention_pattern = re.compile(r'@[a-zA-Z_]', re.IGNORECASE)
+        if mention_pattern.search(message_text or "") or mention_pattern.search(message_html or ""):
+            return
+
+        # 处理媒体
+        media_info = None
+        if media:
+            media_info = await self._process_media(message, media, tenant_id)
+
         # 跳过空消息
         has_content = message_text and message_text.strip()
         has_media = media_info is not None
@@ -248,6 +271,10 @@ class ForwardingService:
             return
 
         # 转发到所有匹配的目标
+        if not await quota_service.reserve_message(tenant_id):
+            logger.warning(f"[T{tenant_id}] Quota exceeded, message dropped")
+            return
+
         for mapping in matched:
             await self._forward_to_dingtalk(
                 tenant_id=tenant_id, mapping=mapping,
@@ -256,28 +283,56 @@ class ForwardingService:
                 message_id=message_id
             )
             # 记录用量
-            await quota_service.record_message(tenant_id)
 
     async def _process_media(self, message, media, tenant_id: int) -> Optional[Dict]:
         """处理媒体文件，按租户存储"""
         try:
-            media_dir = Path(f"/app/data/{tenant_id}/uploads")
+            media_config = await policy_repository.media_for_forwarding(tenant_id) or {
+                "max_file_size_bytes": 52428800,
+                "allowed_types": ["photo", "video", "document"],
+                "forward_as_link": False,
+            }
+            media_dir = Path(settings.PUBLIC_MEDIA_DIR) / str(tenant_id) / "uploads"
             media_dir.mkdir(parents=True, exist_ok=True)
 
             if isinstance(media, MessageMediaPhoto):
+                allowed, reason = evaluate_media_policy(media_config, "photo", 0)
+                if not allowed:
+                    logger.info(f"[T{tenant_id}] Media filtered: {reason}")
+                    return None
                 file_name = f"{uuid.uuid4().hex}.jpg"
                 file_path = media_dir / file_name
                 await message.download_media(str(file_path))
-                url = f"{SERVER_PUBLIC_URL}/static/{tenant_id}/{file_name}"
-                return {"type": "photo", "url": url, "caption": ""}
+                url = f"{SERVER_PUBLIC_URL}/media/{tenant_id}/uploads/{file_name}"
+                return {
+                    "type": "photo", "url": url, "caption": "",
+                    "forward_as_link": media_config.get("forward_as_link", False),
+                }
 
             elif isinstance(media, MessageMediaDocument):
                 doc = media.document
                 is_video = any(isinstance(a, DocumentAttributeVideo) for a in (doc.attributes or []))
                 is_sticker = any(type(a).__name__ == 'DocumentAttributeSticker' for a in (doc.attributes or []))
                 mime_type = getattr(doc, 'mime_type', '') or ''
-
+                audio_attr = next(
+                    (a for a in (doc.attributes or []) if isinstance(a, DocumentAttributeAudio)),
+                    None,
+                )
                 if is_sticker or mime_type == 'image/webp':
+                    media_type = "sticker"
+                elif is_video or mime_type.startswith('video/'):
+                    media_type = "video"
+                elif mime_type.startswith('image/'):
+                    media_type = "photo"
+                elif mime_type.startswith('audio/'):
+                    media_type = "voice" if getattr(audio_attr, "voice", False) else "audio"
+                else:
+                    media_type = "document"
+                allowed, reason = evaluate_media_policy(
+                    media_config, media_type, int(getattr(doc, "size", 0) or 0)
+                )
+                if not allowed:
+                    logger.info(f"[T{tenant_id}] Media filtered: {reason}")
                     return None
 
                 file_name = f"{uuid.uuid4().hex[:8]}"
@@ -294,16 +349,15 @@ class ForwardingService:
 
                 file_path = media_dir / file_name
                 await message.download_media(str(file_path))
-                url = f"{SERVER_PUBLIC_URL}/static/{tenant_id}/{file_name}"
+                url = f"{SERVER_PUBLIC_URL}/media/{tenant_id}/uploads/{file_name}"
 
-                if is_video or mime_type.startswith('video/'):
-                    return {"type": "video", "url": url, "caption": "", "file_name": file_name}
-                elif mime_type.startswith('image/'):
-                    return {"type": "photo", "url": url, "caption": ""}
-                elif mime_type.startswith('audio/'):
-                    return {"type": "voice", "url": url, "caption": "", "file_name": file_name}
-                else:
-                    return {"type": "document", "url": url, "caption": "", "file_name": file_name}
+                return {
+                    "type": media_type,
+                    "url": url,
+                    "caption": "",
+                    "file_name": file_name,
+                    "forward_as_link": media_config.get("forward_as_link", False),
+                }
 
             elif isinstance(media, MessageMediaContact):
                 contact = media.contact
@@ -334,7 +388,7 @@ class ForwardingService:
                 target_bot_ids = [target_bot_ids]
 
             # 加载租户的钉钉机器人配置
-            bots = await database.get_dingtalk_bots(tenant_id)
+            bots = await connector_repository.bots(tenant_id)
             translation_enabled = mapping.get("translation_enabled", True)
 
             # 翻译
@@ -346,6 +400,20 @@ class ForwardingService:
                 except Exception:
                     final_text = message_text
 
+            template = await policy_repository.default_template_for_forwarding(tenant_id)
+            if template:
+                final_text = render_message_template(
+                    template["template_text"],
+                    {
+                        "source": str(mapping.get("source_chat_id", "")),
+                        "time": datetime.now().strftime(template["time_format"]),
+                        "sender": sender_name,
+                        "content": final_text,
+                        "type": media_info.get("type", "text") if media_info else "text",
+                        "chat_id": str(mapping.get("source_chat_id", "")),
+                    },
+                )
+
             for bot_ref in target_bot_ids:
                 # bot_ref 可能是 bot_id 字符串或数字 ID
                 bot_config = None
@@ -354,7 +422,7 @@ class ForwardingService:
                 else:
                     bot_config = next((b for b in bots if b["bot_id"] == bot_ref), None)
 
-                if not bot_config:
+                if not bot_config or not bot_config.get("enabled", True):
                     logger.error(f"[T{tenant_id}] Bot not found: {bot_ref}")
                     continue
 
@@ -363,7 +431,7 @@ class ForwardingService:
                 bot_id_str = bot_config.get("bot_id", str(bot_config["id"]))
 
                 # 构建消息内容
-                if media_info and media_info.get("type") == "photo":
+                if media_info and media_info.get("type") == "photo" and not media_info.get("forward_as_link"):
                     media_url = media_info.get("url", "")
                     clean_text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', final_text, flags=re.DOTALL).strip()
                     full_text = f"{clean_text}\n\n![图片]({media_url})" if clean_text else f"![图片]({media_url})"
@@ -371,7 +439,7 @@ class ForwardingService:
                         webhook=webhook, title="消息转发", text=full_text,
                         secret=secret, bot_id=bot_id_str
                     )
-                elif media_info and media_info.get("type") == "video":
+                elif media_info and media_info.get("type") == "video" and not media_info.get("forward_as_link"):
                     video_url = media_info.get("url", "")
                     result = await dingtalk_service.send_action_card(
                         webhook=webhook, title="视频消息",
@@ -404,7 +472,7 @@ class ForwardingService:
                     self._stats["messages_failed"] += 1
                     logger.error(f"[T{tenant_id}] Forward failed: {result}")
 
-                await database.add_forward_record(
+                await forwarding_repository.add_record(
                     tenant_id=tenant_id,
                     chat_id=mapping.get("source_chat_id"),
                     message_id=message_id,

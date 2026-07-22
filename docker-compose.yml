@@ -1,24 +1,34 @@
 services:
   t2d-saas:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: t2d-saas
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./data:/app/data
+      - ./data/private:/app/private
+      - ./data/public-media:/app/public-media
       - ./logs:/app/logs
-      - ./frontend:/app/static
     environment:
       - TZ=Asia/Shanghai
-      - DATABASE_URL=postgresql://t2d:t2d-saas-2026@localhost:5432/t2d_saas
-      - REDIS_URL=redis://localhost:6379/0
-      - JWT_SECRET=t2d-saas-jwt-secret-2026
-      - DATA_DIR=/app/data
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - REDIS_URL=${REDIS_URL:-redis://127.0.0.1:6379/0}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - SERVER_PUBLIC_URL=${SERVER_PUBLIC_URL:-https://tg2ding.top}
+      - PLATFORM_ADMIN_USERNAME=${PLATFORM_ADMIN_USERNAME:-admin}
+      - PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is required}
+      - TEST_TENANT_NAME=${TEST_TENANT_NAME:-T2D Test Tenant}
+      - TEST_TENANT_USERNAME=${TEST_TENANT_USERNAME:-testtenant}
+      - TEST_TENANT_PASSWORD=${TEST_TENANT_PASSWORD:?TEST_TENANT_PASSWORD is required}
+      - PRIVATE_DATA_DIR=/app/private
+      - PUBLIC_MEDIA_DIR=/app/public-media
       - LOGS_DIR=/app/logs
+      - API_HOST=127.0.0.1
       - API_PORT=8001
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen(\"http://localhost:8001/api/system/health\")"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/v2/system/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 40s

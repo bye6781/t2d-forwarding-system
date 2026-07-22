@@ -6,6 +6,8 @@ starlette==0.38.0
 
 # 数据库
 asyncpg==0.29.0
+alembic==1.14.1
+SQLAlchemy==2.0.37
 
 # Redis
 redis==5.0.0

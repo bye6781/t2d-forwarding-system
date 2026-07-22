@@ -7,6 +7,8 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+frontend/dist/
+.pytest_cache/
 .DS_Store
 *.swp
 *.swo

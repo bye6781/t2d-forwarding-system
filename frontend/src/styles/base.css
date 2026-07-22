@@ -1,0 +1,48 @@
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; min-width: 320px; min-height: 100%; height: 100%; }
+html { background: var(--app-canvas); }
+body {
+  position: relative;
+  background: var(--app-canvas);
+  color: var(--app-text);
+  font-family: "Geist Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  font-synthesis: none;
+  letter-spacing: 0;
+  text-rendering: optimizeLegibility;
+  transition: background-color .2s ease, color .2s ease;
+}
+body::before {
+  content: "";
+  position: fixed;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  opacity: .18;
+  background-image:
+    linear-gradient(var(--app-border-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--app-border-soft) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+button, input, textarea, select { font: inherit; letter-spacing: 0; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 2px;
+}
+::selection { background: var(--app-accent-soft); color: var(--app-text); }
+.skip-link {
+  position: fixed;
+  z-index: 100;
+  top: 8px;
+  left: 8px;
+  transform: translateY(-150%);
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--app-accent);
+  color: #fff;
+  text-decoration: none;
+  transition: transform .16s ease;
+}
+.skip-link:focus { transform: translateY(0); }

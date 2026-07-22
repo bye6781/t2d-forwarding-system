@@ -1,160 +1,198 @@
-"""
-T2D SaaS 主入口
-多租户 Telegram → 钉钉消息转发平台
-"""
-import sys
-import asyncio
+"""T2D V2 domain-modular application entrypoint."""
 import logging
-from logging.handlers import RotatingFileHandler
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.database import database
-from app.core.middleware import TenantContextMiddleware
+from app.core.middleware import AuditLogMiddleware, TenantContextMiddleware
+from app.core.security import hash_password
+from app.modules.auth import router as auth
+from app.modules.auth.repository import auth_repository
+from app.modules.audit import router as audit
+from app.modules.connectors import router as connectors
+from app.modules.connectors.repository import connector_repository
+from app.modules.forwarding import router as forwarding
+from app.modules.forwarding.runtime import redis_client, tenant_runtime
+from app.modules.platform import router as platform
+from app.modules.policies import router as policies
+from app.modules.tenants import router as tenants
 
-# 日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
-            f"{settings.LOGS_DIR}/t2d-saas.log",
-            maxBytes=10*1024*1024,
-            backupCount=5,
-            encoding="utf-8"
-        ),
-    ],
-)
+
+def configure_logging() -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        Path(settings.LOGS_DIR).mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(Path(settings.LOGS_DIR) / "t2d-saas.log", encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+
+configure_logging()
 logger = logging.getLogger("t2d-saas")
+
+
+async def bootstrap_accounts() -> None:
+    if not await auth_repository.platform_tenant_exists():
+        await database.execute(
+            "INSERT INTO tenants(id,name,slug,plan,status) VALUES(0,'Platform','platform','free','active')"
+        )
+    admin = await database.fetchrow(
+        "SELECT id FROM users WHERE tenant_id=0 AND username=$1", settings.PLATFORM_ADMIN_USERNAME
+    )
+    if not admin:
+        if not settings.PLATFORM_ADMIN_PASSWORD:
+            raise RuntimeError("PLATFORM_ADMIN_PASSWORD must be set for initial deployment")
+        async with database.transaction() as connection:
+            user_id = await connection.fetchval(
+                """INSERT INTO users(tenant_id,username,password_hash,role)
+                   VALUES(0,$1,$2,'owner') RETURNING id""",
+                settings.PLATFORM_ADMIN_USERNAME, hash_password(settings.PLATFORM_ADMIN_PASSWORD),
+            )
+            await connection.execute("INSERT INTO platform_admins(user_id) VALUES($1)", user_id)
+
+    if settings.TEST_TENANT_USERNAME and settings.TEST_TENANT_PASSWORD:
+        exists = await database.fetchval(
+            "SELECT id FROM users WHERE username=$1", settings.TEST_TENANT_USERNAME
+        )
+        if not exists:
+            limits = settings.PLAN_LIMITS["free"]
+            async with database.transaction() as connection:
+                tenant_id = await connection.fetchval(
+                    "INSERT INTO tenants(name,slug,plan,status) VALUES($1,$2,'free','active') RETURNING id",
+                    settings.TEST_TENANT_NAME or "T2D Test Tenant", "t2d-test",
+                )
+                await connection.execute(
+                    """INSERT INTO users(tenant_id,username,password_hash,role)
+                       VALUES($1,$2,$3,'owner')""",
+                    tenant_id, settings.TEST_TENANT_USERNAME, hash_password(settings.TEST_TENANT_PASSWORD),
+                )
+                await connection.execute(
+                    """INSERT INTO subscriptions
+                       (tenant_id,plan,status,message_quota,tg_account_limit,mapping_limit,
+                        current_period_start,current_period_end)
+                       VALUES($1,'free','active',$2,$3,$4,NOW(),NOW()+INTERVAL '30 days')""",
+                    tenant_id, limits["message_quota"], limits["tg_account_limit"], limits["mapping_limit"],
+                )
+
+
+async def connect_authorized_accounts() -> None:
+    from app.services.telegram_service import telegram_service
+
+    accounts = await connector_repository.authorized_accounts_for_startup()
+    for account in accounts:
+        try:
+            connected = await telegram_service.connect_account(
+                tenant_id=account["tenant_id"], account_db_id=account["id"],
+                api_id=account["api_id"], api_hash=account["api_hash"], phone=account["phone"],
+            )
+            if connected:
+                await tenant_runtime.start(account["tenant_id"])
+        except Exception:
+            logger.exception("Failed to auto-connect Telegram account %s", account["id"])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    logger.info("T2D SaaS starting up...")
-
-    # 初始化数据库连接池
+    Path(settings.PRIVATE_DATA_DIR, "sessions").mkdir(parents=True, exist_ok=True)
+    Path(settings.PUBLIC_MEDIA_DIR).mkdir(parents=True, exist_ok=True)
     await database.init()
-    logger.info("Database connection pool initialized")
-
-    # 确保数据目录存在
-    data_dir = Path("/app/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "sessions").mkdir(parents=True, exist_ok=True)
-
-    # 确保平台租户存在
-    platform_tenant = await database.get_tenant(0)
-    if not platform_tenant:
-        await database.execute(
-            "INSERT INTO tenants (id, name, slug, plan, status) VALUES (0, 'Platform', 'platform', 'free', 'active')"
-        )
-        logger.info("Platform tenant created")
-
-    # 确保平台管理员存在
-    admin_user = await database.fetchrow(
-        "SELECT id FROM users WHERE username = 'admin' AND tenant_id = 0"
-    )
-    if not admin_user:
-        from app.core.security import hash_password
-        admin_id = await database.create_user(
-            tenant_id=0,
-            username="admin",
-            password_hash=hash_password("admin123"),
-            role="owner"
-        )
-        await database.execute(
-            "INSERT INTO platform_admins (user_id) VALUES ($1)", admin_id
-        )
-        logger.info(f"Platform admin created (id={admin_id})")
-
-    # 启动转发引擎
+    await bootstrap_accounts()
     from app.services.forwarding_service import forwarding_service
     await forwarding_service.start()
-    logger.info("Forwarding engine started")
-
-    # 自动连接所有已授权的 TG 账号
-    tenants = await database.fetch("SELECT id FROM tenants WHERE status = 'active' AND id > 0")
-    connected_count = 0
-    for tenant in tenants:
-        tid = tenant["id"]
-        accounts = await database.get_tg_accounts(tid)
-        for acc in accounts:
-            if acc.get("is_authorized"):
-                try:
-                    from app.services.telegram_service import telegram_service
-                    await telegram_service.connect_account(
-                        tenant_id=tid,
-                        account_db_id=acc["id"],
-                        api_id=acc["api_id"],
-                        api_hash=acc["api_hash"],
-                        phone=acc["phone"],
-                    )
-                    connected_count += 1
-                except Exception as e:
-                    logger.warning(f"Auto-connect TG account {acc['id']} for tenant {tid} failed: {e}")
-
-    logger.info(f"Auto-connected {connected_count} TG accounts")
-    logger.info("T2D SaaS started successfully")
-
+    await connect_authorized_accounts()
+    logger.info("T2D V2 started")
     yield
-
-    # 关闭
-    logger.info("T2D SaaS shutting down...")
-    from app.services.forwarding_service import forwarding_service as fs
-    await fs.stop()
-    from app.services.telegram_service import telegram_service as ts
-    await ts.disconnect_all()
+    await forwarding_service.stop()
+    from app.services.telegram_service import telegram_service
+    from app.services.dingtalk_service import dingtalk_service
+    await telegram_service.disconnect_all()
+    await dingtalk_service.close()
+    await redis_client.aclose()
     await database.close()
-    logger.info("T2D SaaS stopped")
 
 
-# 创建 FastAPI 应用
-app = FastAPI(
-    title="T2D SaaS",
-    description="多租户 Telegram → 钉钉消息转发平台",
-    version="2.0.0",
-    lifespan=lifespan,
-)
-
-# 中间件
+app = FastAPI(title="T2D Cloud API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(TenantContextMiddleware)
-
-# 静态文件 - 租户媒体文件
-app.mount("/static", StaticFiles(directory="/app/data"), name="static")
-
-# 注册路由
-from app.routers import auth, tenants, system, telegram_accounts, dingtalk_bots, mappings, forwarding
-
-app.include_router(auth.router)
-app.include_router(tenants.router)
-app.include_router(system.router)
-app.include_router(telegram_accounts.router)
-app.include_router(dingtalk_bots.router)
-app.include_router(mappings.router)
-app.include_router(forwarding.router)
+app.add_middleware(AuditLogMiddleware)
 
 
-# 前端 SPA 路由
-@app.get("/")
-async def index():
-    index_path = Path("/app/static/index.html")
-    if index_path.exists():
-        return FileResponse(str(index_path))
-    return {"message": "T2D SaaS API is running", "version": "2.0.0"}
+@app.exception_handler(HTTPException)
+async def http_error(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict):
+        detail = exc.detail
+    else:
+        detail = {"code": f"http_{exc.status_code}", "message": str(exc.detail)}
+    return JSONResponse({"detail": detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        {"detail": {"code": "validation_error", "message": "请求参数无效", "fields": exc.errors()}},
+        status_code=422,
+    )
+
+
+@app.get("/api/v2/system/health")
+async def health():
+    database_status = "ok"
+    redis_status = "ok"
+    try:
+        await database.fetchval("SELECT 1")
+    except Exception:
+        database_status = "error"
+    try:
+        await redis_client.ping()
+    except Exception:
+        redis_status = "error"
+    status = "healthy" if database_status == redis_status == "ok" else "degraded"
+    payload = {"data": {"status": status, "database": database_status, "redis": redis_status, "version": "2.0.0"}}
+    return JSONResponse(payload, status_code=200 if status == "healthy" else 503)
+
+
+app.include_router(auth.router, prefix="/api/v2/auth")
+app.include_router(tenants.router, prefix="/api/v2/tenant")
+app.include_router(platform.router, prefix="/api/v2/platform")
+app.include_router(connectors.router, prefix="/api/v2/connectors")
+app.include_router(forwarding.router, prefix="/api/v2/forwarding")
+app.include_router(policies.router, prefix="/api/v2/policies")
+app.include_router(audit.router, prefix="/api/v2/audit")
+
+Path(settings.PUBLIC_MEDIA_DIR).mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=settings.PUBLIC_MEDIA_DIR), name="media")
+web_dir = Path("/app/web")
+if not web_dir.exists():
+    web_dir = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+
+@app.get("/{path:path}")
+async def spa(path: str):
+    if path == "api" or path.startswith("api/"):
+        return JSONResponse(
+            {"detail": {"code": "not_found", "message": "API endpoint not found"}},
+            status_code=404,
+        )
+    candidate = web_dir / path
+    if path and candidate.is_file():
+        return FileResponse(candidate)
+    index = web_dir / "index.html"
+    if index.exists():
+        return FileResponse(index)
+    return JSONResponse({"detail": {"code": "frontend_unavailable", "message": "前端尚未构建"}}, status_code=503)
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=settings.API_PORT,
-        reload=False,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host=settings.API_HOST, port=settings.API_PORT, log_level="info")
