@@ -30,13 +30,22 @@ class TelegramAccount:
 
     @property
     def connected(self) -> bool:
-        return self._connected
+        if not self._client or not self._connected:
+            return False
+        is_connected = getattr(self._client, "is_connected", None)
+        return bool(is_connected() if callable(is_connected) else is_connected)
 
     @property
     def session_path(self) -> str:
         return f"{settings.PRIVATE_DATA_DIR}/sessions/{self.tenant_id}/{self.account_id}"
 
-    async def connect(self):
+    def _register_event_handler(self) -> None:
+        if self._client and not self._event_handler_registered:
+            from telethon.events import NewMessage
+            self._client.add_event_handler(self._on_message, NewMessage())
+            self._event_handler_registered = True
+
+    async def connect(self, request_code: bool = True):
         """连接到 Telegram"""
         try:
             import os
@@ -52,15 +61,16 @@ class TelegramAccount:
                 me = await self._client.get_me()
                 logger.info(f"[T{self.tenant_id}:A{self.account_id}] Connected: {me.first_name}")
                 self._connected = True
-                if not self._event_handler_registered:
-                    self._client.add_event_handler(self._on_message, NewMessage())
-                    self._event_handler_registered = True
+                self._register_event_handler()
                 return True
-            else:
+            if request_code:
                 logger.info(f"[T{self.tenant_id}:A{self.account_id}] Sending code to {self.phone}...")
                 await self._client.send_code_request(self.phone)
                 self._connected = False
                 return "pending_code"
+            logger.warning(f"[T{self.tenant_id}:A{self.account_id}] Session is no longer authorized; manual login required")
+            self._connected = False
+            return "unauthorized"
 
         except SessionPasswordNeededError:
             logger.error(f"[T{self.tenant_id}:A{self.account_id}] 2FA required")
@@ -82,9 +92,7 @@ class TelegramAccount:
             self._connected = True
             me = await self._client.get_me()
             logger.info(f"[T{self.tenant_id}:A{self.account_id}] Login OK: {me.first_name}")
-            if not self._event_handler_registered:
-                self._client.add_event_handler(self._on_message, NewMessage())
-                self._event_handler_registered = True
+            self._register_event_handler()
             return True
         except SessionPasswordNeededError:
             if password:
@@ -94,9 +102,7 @@ class TelegramAccount:
                     self._connected = True
                     me = await self._client.get_me()
                     logger.info(f"[T{self.tenant_id}:A{self.account_id}] 2FA login OK")
-                    if not self._event_handler_registered:
-                        self._client.add_event_handler(self._on_message, NewMessage())
-                        self._event_handler_registered = True
+                    self._register_event_handler()
                     return True
                 except Exception as e2:
                     logger.error(f"[T{self.tenant_id}:A{self.account_id}] 2FA failed: {e2}")
@@ -105,6 +111,24 @@ class TelegramAccount:
         except Exception as e:
             logger.error(f"[T{self.tenant_id}:A{self.account_id}] Verify failed: {e}")
             self._connected = False
+            return False
+
+    async def ensure_connected(self) -> bool:
+        """Restore an authorized session after a transient network disconnect."""
+        if not self._client:
+            return False
+        try:
+            if not self._client.is_connected():
+                await self._client.connect()
+            if not await self._client.is_user_authorized():
+                self._connected = False
+                return False
+            self._connected = True
+            self._register_event_handler()
+            return True
+        except Exception as exc:
+            self._connected = False
+            logger.warning(f"[T{self.tenant_id}:A{self.account_id}] Reconnect failed: {exc}")
             return False
 
     async def disconnect(self):
@@ -170,18 +194,20 @@ class TelegramService:
 
     async def connect_account(self, tenant_id: int, account_db_id: int,
                               api_id: int, api_hash: str, phone: str,
-                              name: str = "default") -> Any:
+                              name: str = "default", request_code: bool = True) -> Any:
         """连接单个账号"""
-        account = TelegramAccount(account_db_id, tenant_id, api_id, api_hash, phone, name)
-        for handler in self._global_handlers:
-            account.add_handler(handler)
         key = self._key(tenant_id, account_db_id)
         # 断开旧连接
         old = self._accounts.get(key)
-        if old and old.connected:
+        if old and not request_code and await old.ensure_connected():
+            return True
+        if old and old._client:
             await old.disconnect()
+        account = TelegramAccount(account_db_id, tenant_id, api_id, api_hash, phone, name)
+        for handler in self._global_handlers:
+            account.add_handler(handler)
         self._accounts[key] = account
-        result = await account.connect()
+        result = await account.connect(request_code=request_code)
         logger.info(f"Account T{tenant_id}:A{account_db_id} connect result: {result}")
         return result
 

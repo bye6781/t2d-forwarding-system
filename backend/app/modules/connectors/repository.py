@@ -43,7 +43,7 @@ class ConnectorRepository:
     async def authorized_accounts_for_startup(self):
         return await database.fetch(
             """SELECT a.* FROM telegram_accounts a JOIN tenants t ON t.id=a.tenant_id
-               WHERE a.is_authorized AND t.status='active' AND t.id>0"""
+               WHERE a.is_authorized AND t.status='active'"""
         )
 
     async def bot(self, tenant_id: int, bot_db_id: int):

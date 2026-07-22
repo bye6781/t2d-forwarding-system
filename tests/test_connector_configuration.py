@@ -108,6 +108,57 @@ def test_telegram_send_code_failure_is_returned_as_http_error(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_startup_accounts_include_platform_tenant(monkeypatch):
+    from app.core.database import database
+    from app.modules.connectors.repository import connector_repository
+
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(database, "fetch", fetch)
+
+    async def scenario():
+        await connector_repository.authorized_accounts_for_startup()
+        query = fetch.await_args.args[0]
+        assert "a.is_authorized" in query
+        assert "t.status='active'" in query
+        assert "t.id>0" not in query
+
+    asyncio.run(scenario())
+
+
+def test_startup_reconnect_never_requests_a_login_code(monkeypatch):
+    import main
+    from app.modules.connectors.repository import connector_repository
+    from app.services.telegram_service import telegram_service
+
+    monkeypatch.setattr(
+        connector_repository,
+        "authorized_accounts_for_startup",
+        AsyncMock(return_value=[{
+            "tenant_id": 0,
+            "id": 6,
+            "api_id": 12345,
+            "api_hash": "api-hash",
+            "phone": "+8613800000000",
+        }]),
+    )
+    connect = AsyncMock(return_value=True)
+    monkeypatch.setattr(telegram_service, "connect_account", connect)
+    monkeypatch.setattr(main.tenant_runtime, "start", AsyncMock())
+
+    async def scenario():
+        await main.connect_authorized_accounts()
+        connect.assert_awaited_once_with(
+            tenant_id=0,
+            account_db_id=6,
+            api_id=12345,
+            api_hash="api-hash",
+            phone="+8613800000000",
+            request_code=False,
+        )
+
+    asyncio.run(scenario())
+
+
 def test_dingtalk_test_uses_send_text_content_parameter(monkeypatch):
     from app.modules.connectors.repository import connector_repository
     from app.modules.connectors.service import connector_service

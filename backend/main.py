@@ -1,4 +1,5 @@
 """T2D V2 domain-modular application entrypoint."""
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -97,11 +98,28 @@ async def connect_authorized_accounts() -> None:
             connected = await telegram_service.connect_account(
                 tenant_id=account["tenant_id"], account_db_id=account["id"],
                 api_id=account["api_id"], api_hash=account["api_hash"], phone=account["phone"],
+                request_code=False,
             )
-            if connected:
+            if connected is True:
                 await tenant_runtime.start(account["tenant_id"])
+            elif connected == "unauthorized":
+                logger.warning(
+                    "Telegram account %s requires manual authorization; no code was requested",
+                    account["id"],
+                )
         except Exception:
             logger.exception("Failed to auto-connect Telegram account %s", account["id"])
+
+
+async def monitor_telegram_connections() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await connect_authorized_accounts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Telegram connection health check failed")
 
 
 @asynccontextmanager
@@ -113,8 +131,18 @@ async def lifespan(app: FastAPI):
     from app.services.forwarding_service import forwarding_service
     await forwarding_service.start()
     await connect_authorized_accounts()
+    telegram_monitor = asyncio.create_task(
+        monitor_telegram_connections(), name="telegram-connection-monitor"
+    )
     logger.info("T2D V2 started")
-    yield
+    try:
+        yield
+    finally:
+        telegram_monitor.cancel()
+        try:
+            await telegram_monitor
+        except asyncio.CancelledError:
+            pass
     await forwarding_service.stop()
     from app.services.telegram_service import telegram_service
     from app.services.dingtalk_service import dingtalk_service
